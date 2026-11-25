@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Reel
+GenericName=Media Player
+Comment=Play videos, music and streams
+Exec=reel %U
+Icon=io.github.voidrlm.Reel
+Terminal=false
+Categories=AudioVideo;Video;Audio;Player;GTK;
+Keywords=video;movie;music;player;media;vlc;mp4;mkv;subtitles;
+MimeType=video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;video/x-ms-wmv;video/x-flv;video/mpeg;video/mp2t;video/3gpp;video/ogg;video/x-ogm+ogg;video/vnd.avi;video/x-m4v;video/vnd.rn-realvideo;application/vnd.rn-realmedia;video/dv;audio/mpeg;audio/mp4;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/x-opus+ogg;audio/aac;audio/x-wav;audio/x-ms-wma;audio/x-matroska;audio/x-ape;audio/x-aiff;application/x-matroska;
+StartupNotify=true
+SingleMainWindow=true

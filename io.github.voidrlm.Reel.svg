@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="face" x1="0" y1="8" x2="0" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8f7bff"/>
+      <stop offset="0.55" stop-color="#5d4cf0"/>
+      <stop offset="1" stop-color="#3a2fc4"/>
+    </linearGradient>
+    <linearGradient id="lip" x1="0" y1="64" x2="0" y2="124" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2f2699"/>
+      <stop offset="1" stop-color="#1f1a6e"/>
+    </linearGradient>
+    <radialGradient id="shine" cx="64" cy="20" r="62" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="64" cy="66" r="56" fill="url(#lip)"/>
+  <circle cx="64" cy="61" r="56" fill="url(#face)"/>
+  <circle cx="64" cy="61" r="56" fill="url(#shine)"/>
+  <!-- film reel ring -->
+  <circle cx="64" cy="61" r="40" fill="none" stroke="#ffffff" stroke-opacity="0.22" stroke-width="5"/>
+  <g fill="#ffffff" fill-opacity="0.22">
+    <circle cx="64" cy="27" r="5"/><circle cx="96.3" cy="50.5" r="5"/><circle cx="84" cy="88.5" r="5"/>
+    <circle cx="44" cy="88.5" r="5"/><circle cx="31.7" cy="50.5" r="5"/>
+  </g>
+  <!-- play triangle -->
+  <path d="M54 44.5c0-3.4 3.7-5.5 6.6-3.8l26 15.5c2.9 1.7 2.9 5.9 0 7.6l-26 15.5c-2.9 1.7-6.6-.4-6.6-3.8z"
+        fill="#2a2290" fill-opacity="0.3" transform="translate(0 3)"/>
+  <path d="M54 44.5c0-3.4 3.7-5.5 6.6-3.8l26 15.5c2.9 1.7 2.9 5.9 0 7.6l-26 15.5c-2.9 1.7-6.6-.4-6.6-3.8z"
+        fill="#ffffff"/>
+</svg>
