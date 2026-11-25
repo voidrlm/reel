@@ -1,8 +1,10 @@
 """Reel: a simple video and music player (GTK 4 + libadwaita + GStreamer)."""
+import bisect
 import json
 import os
 import re
 import sys
+import threading
 import time
 
 import gi
@@ -10,7 +12,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
-from gi.repository import Adw, Gdk, Gio, GLib, Gst, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gst, Gtk, Pango  # noqa: E402
+
+import ai  # noqa: E402
 
 try:
     gi.require_version("GstPbutils", "1.0")
@@ -35,6 +39,7 @@ MEDIA_EXT = VIDEO_EXT | AUDIO_EXT
 SUB_EXT = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".smi"}
 SPEEDS = ["0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0"]
 PLAY_FLAG_TEXT = 1 << 2
+AI_TRACK = 1000  # subtitle menu value for the AI subtitles
 HIDE_AFTER_MS = 2500
 TAP_GAP_MS = 280  # max gap between clicks of a double/triple click
 HOLD_MS = 400  # press this long on the left/right of the video to rewind/fast-forward
@@ -52,6 +57,10 @@ headerbar.reel-osd {
   color: white;
 }
 .reel-time { font-feature-settings: "tnum"; font-size: 0.92em; min-width: 3.6em; }
+.reel-aisub {
+  color: white; font-weight: 600; background: alpha(black, 0.55);
+  border-radius: 8px; padding: 2px 12px; text-shadow: 0 1px 3px black;
+}
 .reel-flash {
   background: alpha(black, 0.6); color: white; border-radius: 14px;
   padding: 10px 20px; font-weight: bold; font-size: 1.25em;
@@ -238,6 +247,15 @@ class Window(Adw.ApplicationWindow):
         self._hold_started = self._rewind_pos = 0.0
         self._hold_rate = 1.0
         self._hold_was_playing = False
+        self.ai_job = None
+        self.ai_installer = None
+        self.ai_chunks = {}
+        self.ai_cues, self.ai_starts = [], []
+        self.ai_show = False
+        self.ai_label = None  # e.g. "AI · English"
+        self.ai_translate = False
+        self.ai_status = None
+        self._sub_px = 0
         self._inhibit = 0
         self._last_user_seek = 0.0
         self._last_motion = None
@@ -250,6 +268,7 @@ class Window(Adw.ApplicationWindow):
         self._sync_volume_ui()
         self._set_mode(False)
         GLib.timeout_add(250, self._tick)
+        GLib.timeout_add(100, self._ai_tick)
         self.connect("close-request", self._on_close)
         self.connect("notify::fullscreened", self._on_fullscreen_changed)
 
@@ -309,6 +328,10 @@ class Window(Adw.ApplicationWindow):
                                can_target=False)
         self.flash.add_css_class("reel-flash")
         stage.add_overlay(self.flash)
+        self.ai_sub = Gtk.Label(halign=Gtk.Align.CENTER, valign=Gtk.Align.END, visible=False, can_target=False,
+                                wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=48)
+        self.ai_sub.add_css_class("reel-aisub")
+        stage.add_overlay(self.ai_sub)
         self.spinner = Adw.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, visible=False,
                                    width_request=48, height_request=48, can_target=False)
         stage.add_overlay(self.spinner)
@@ -392,6 +415,8 @@ class Window(Adw.ApplicationWindow):
         add("load-subtitle", self.choose_subtitle)
         add("shortcuts", self.show_shortcuts)
         add("about", self.show_about)
+        add("ai-generate", self.choose_ai)
+        add("ai-stop", self.stop_ai)
 
         self.audio_action = Gio.SimpleAction.new_stateful("audio-track", GLib.VariantType("i"), GLib.Variant("i", 0))
         self.audio_action.connect("change-state", self._on_audio_action)
@@ -529,6 +554,8 @@ class Window(Adw.ApplicationWindow):
         self._save_position()
         p = self.player
         p.set_state(Gst.State.NULL)
+        if uri != self.uri:
+            self._reset_ai()
         self.uri = uri
         self.title_override = title
         sub = subtitle or self._find_subtitle(uri)
@@ -552,7 +579,7 @@ class Window(Adw.ApplicationWindow):
         self.pos_label.set_label("0:00")
         self.dur_label.set_label("0:00")
         self.wtitle.set_title(title or display_name(uri))
-        self.wtitle.set_subtitle(f"{self.index + 1} of {len(self.queue)}" if len(self.queue) > 1 else "")
+        self._update_subtitle_line()
         self.prev_btn.set_visible(len(self.queue) > 1)
         self.next_btn.set_visible(len(self.queue) > 1)
         self.media_stack.set_visible_child_name("video")
@@ -689,14 +716,15 @@ class Window(Adw.ApplicationWindow):
         self.full_btn.set_icon_name("view-restore-symbolic" if self.is_fullscreen() else "view-fullscreen-symbolic")
 
     def cycle_subtitle(self):
-        n = self.player.pipe.props.n_text
-        if not n:
+        choices = [-1] + list(range(self.player.pipe.props.n_text)) + ([AI_TRACK] if self.ai_label else [])
+        if len(choices) == 1:
             self._flash("No subtitles")
             return
-        cur = self.player.pipe.props.current_text if self.player.subtitles_on() else -1
-        nxt = cur + 1 if cur + 1 < n else -1
+        cur = self.sub_action.get_state().get_int32()
+        nxt = choices[(choices.index(cur) + 1) % len(choices)] if cur in choices else choices[0]
         self.sub_action.change_state(GLib.Variant("i", nxt))
-        self._flash("Subtitles off" if nxt < 0 else f"Subtitles: {self._sub_name(nxt)}")
+        name = self.ai_label if nxt == AI_TRACK else self._sub_name(nxt) if nxt >= 0 else None
+        self._flash(f"Subtitles: {name}" if name else "Subtitles off")
 
     def cycle_audio(self):
         n = self.player.pipe.props.n_audio
@@ -712,7 +740,9 @@ class Window(Adw.ApplicationWindow):
         action.set_state(value)
 
     def _on_sub_action(self, action, value):
-        self.player.set_subtitle(value.get_int32())
+        index = value.get_int32()
+        self.ai_show = index == AI_TRACK
+        self.player.set_subtitle(-1 if self.ai_show else index)
         action.set_state(value)
 
     def _sub_name(self, i):
@@ -735,9 +765,18 @@ class Window(Adw.ApplicationWindow):
         subs.append("Off", "win.subtitle(-1)")
         for i in range(pipe.props.n_text):
             subs.append(self._sub_name(i), f"win.subtitle({i})")
+        if self.ai_label:
+            subs.append(self.ai_label, f"win.subtitle({AI_TRACK})")
         subs.append("Load from File…", "win.load-subtitle")
+        if self.ai_job or self.ai_installer:
+            subs.append("Stop Generating", "win.ai-stop")
+        else:
+            subs.append("Generate with AI…", "win.ai-generate")
         menu.append_section("Subtitles", subs)
-        cur = pipe.props.current_text if self.player.subtitles_on() and pipe.props.n_text else -1
+        if self.ai_show:
+            cur = AI_TRACK
+        else:
+            cur = pipe.props.current_text if self.player.subtitles_on() and pipe.props.n_text else -1
         self.sub_action.set_state(GLib.Variant("i", cur))
         speed = Gio.Menu()
         for s in SPEEDS:
@@ -810,6 +849,7 @@ class Window(Adw.ApplicationWindow):
         if self.pending_subtitle == "external" and pipe.props.n_text:
             self.player.set_subtitle(pipe.props.n_text - 1)
         self.pending_subtitle = None
+        self._restore_ai()
         self._rebuild_tracks()
         if self.pending_seek:
             start, announce = self.pending_seek
@@ -1165,6 +1205,180 @@ class Window(Adw.ApplicationWindow):
                                 comments="A simple player for videos, music and streams.")
         about.present(self)
 
+    # ---- AI subtitles -----------------------------------------------------------------------
+
+    def choose_ai(self):
+        if not self.uri:
+            return
+        key = ai.pick_model()
+        mb = ai.download_mb(key)
+        need_engine = ai.whisper_cli() is None
+        lines = ["Whisper listens to the audio and writes subtitles on this computer. Nothing is uploaded. "
+                 "They appear while you watch, a minute at a time."]
+        setup = []
+        if need_engine:
+            setup.append("set up the AI engine (a few minutes)")
+        if mb:
+            setup.append(f"download the “{key}” model picked for this PC ({mb} MB)")
+        if setup:
+            lines.append("First, Reel will " + " and ".join(setup) + ". This happens only once.")
+        dialog = Adw.AlertDialog(heading="Generate Subtitles with AI", body="\n\n".join(lines))
+        lang = Adw.ComboRow(title="Language", model=Gtk.StringList.new(["Same as the video", "English (translate)"]))
+        lang.set_selected(1 if self.cfg.data.get("ai_translate") else 0)
+        box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        box.add_css_class("boxed-list")
+        box.append(lang)
+        dialog.set_extra_child(box)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("go", "Generate")
+        dialog.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("go")
+        dialog.set_close_response("cancel")
+
+        def response(_d, rid):
+            if rid == "go":
+                self.cfg.data["ai_translate"] = lang.get_selected() == 1
+                self.cfg.save()
+                self.start_ai(self.cfg.data["ai_translate"])
+
+        dialog.connect("response", response)
+        dialog.present(self)
+
+    def start_ai(self, translate):
+        if self.ai_job:
+            self.ai_job.cancel()
+            self.ai_job = None
+        if ai.whisper_cli() is None:
+            self.ai_installer = ai.Installer(self._on_ai_status, lambda ok, why: self._on_installed(ok, why, translate))
+            self.ai_installer.start()
+            self._on_ai_status("Setting up the AI engine", 0)
+            self._rebuild_tracks()
+            return
+        if self.ai_label is None or self.ai_translate != translate:
+            self.ai_chunks = ai.load_cached_cues(self.uri, translate)
+            self._merge_ai_cues()
+        self.ai_translate = translate
+        self.ai_label = "AI · English" if translate else "AI subtitles"
+        self.ai_show = True
+        self.player.set_subtitle(-1)
+        pipe = self.player.pipe
+        self.ai_job = ai.Job(self.uri, translate, pipe.props.current_audio, self.player.position() or 0,
+                             self._on_ai_status, self._on_ai_cues, self._on_ai_done, self._on_ai_error, self.toast)
+        self.ai_job.start()
+        self._rebuild_tracks()
+
+    def _on_installed(self, ok, why, translate):
+        self.ai_installer = None
+        if ok and self.uri:
+            self.start_ai(translate)
+        else:
+            self._on_ai_status(None, 0)
+            self._rebuild_tracks()
+            if not ok:
+                self.toast(f"Couldn't set up the AI engine: {why or 'unknown error'}")
+        return GLib.SOURCE_REMOVE
+
+    def stop_ai(self):
+        if self.ai_job:
+            self.ai_job.cancel()
+            self.ai_job = None
+        if self.ai_installer:
+            self.ai_installer.cancel()
+            self.ai_installer = None
+        self._on_ai_status(None, 0)
+        self._rebuild_tracks()
+
+    def _reset_ai(self):
+        if self.ai_job:
+            self.ai_job.cancel()
+            self.ai_job = None
+        self.ai_chunks = {}
+        self.ai_cues, self.ai_starts = [], []
+        self.ai_show = False
+        self.ai_label = None
+        self.ai_status = None
+        self.ai_sub.set_visible(False)
+
+    def _restore_ai(self):
+        """Bring back AI subtitles made earlier for this video, and finish them if they were cut short."""
+        if self.ai_label or self.ai_installer or not self.uri:
+            return
+        cached = ai.find_cached(self.uri)
+        if not cached:
+            return
+        translate, complete = cached
+        if not complete and ai.whisper_cli():
+            self.start_ai(translate)
+            return
+        self.ai_translate = translate
+        self.ai_chunks = ai.load_cached_cues(self.uri, translate)
+        self._merge_ai_cues()
+        self.ai_label = "AI · English" if translate else "AI subtitles"
+        if not self.player.subtitles_on() or not self.player.pipe.props.n_text:
+            self.ai_show = True
+            self.player.set_subtitle(-1)
+
+    def _on_ai_status(self, text, fraction):
+        self.ai_status = f"{text} · {int(fraction * 100)}%" if text else None
+        self._update_subtitle_line()
+        return GLib.SOURCE_REMOVE
+
+    def _on_ai_cues(self, index, cues):
+        self.ai_chunks[index] = cues
+        self._merge_ai_cues()
+
+    def _merge_ai_cues(self):
+        self.ai_cues = sorted(c for chunk in self.ai_chunks.values() for c in chunk)
+        self.ai_starts = [c[0] for c in self.ai_cues]
+
+    def _on_ai_done(self):
+        self.ai_job = None
+        self._on_ai_status(None, 0)
+        self._rebuild_tracks()
+        self.toast("AI subtitles are ready")
+
+    def _on_ai_error(self, message):
+        self.ai_job = None
+        self._on_ai_status(None, 0)
+        self._rebuild_tracks()
+        self.toast(f"AI subtitles stopped: {message}")
+
+    def _update_subtitle_line(self):
+        parts = []
+        if len(self.queue) > 1 and self.uri:
+            parts.append(f"{self.index + 1} of {len(self.queue)}")
+        if self.ai_status:
+            parts.append(self.ai_status)
+        self.wtitle.set_subtitle("  ·  ".join(parts))
+
+    def _ai_tick(self):
+        pos = self.player.position() if self.uri else None
+        if self.ai_job and pos is not None:
+            self.ai_job.focus = pos
+        text = ""
+        if self.ai_show and self.ai_cues and pos is not None:
+            i = bisect.bisect_right(self.ai_starts, pos) - 1
+            if i >= 0 and pos <= self.ai_cues[i][1]:
+                text = self.ai_cues[i][2]
+        if text != self.ai_sub.get_label():
+            self.ai_sub.set_label(text)
+        self.ai_sub.set_visible(bool(text))
+        if text:
+            height = self.stage.get_height()
+            px = int(min(44, max(15, height * 0.045)))
+            if px != self._sub_px:
+                self._sub_px = px
+                attrs = Pango.AttrList()
+                attrs.insert(Pango.attr_size_new_absolute(px * Pango.SCALE))
+                self.ai_sub.set_attributes(attrs)
+            if self.view.get_reveal_bottom_bars():
+                margin = self.view.get_bottom_bar_height() + 6
+            else:
+                margin = max(16, int(height * 0.05))
+            if self.ai_sub.get_margin_bottom() != margin:
+                self.ai_sub.set_margin_bottom(margin)
+        return GLib.SOURCE_CONTINUE
+
     # ---- misc ---------------------------------------------------------------------------
 
     def toast(self, text):
@@ -1196,9 +1410,17 @@ class Window(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _on_close(self, *_):
+        """Closing the window ends Reel completely, even if something below hangs."""
         self._save_position()
         self.cfg.save()
+        if self.ai_job:
+            self.ai_job.cancel()
+        if self.ai_installer:
+            self.ai_installer.cancel()
+        self.set_visible(False)
+        threading.Timer(3, os._exit, (0,)).start()  # last resort if GStreamer teardown blocks
         self.player.set_state(Gst.State.NULL)
+        self.get_application().quit()
         return False
 
 
@@ -1271,4 +1493,7 @@ class App(Adw.Application):
 
 def main():
     Gst.init(None)
-    return App().run(sys.argv)
+    status = App().run(sys.argv)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(status)  # don't wait on GStreamer or AI worker threads
