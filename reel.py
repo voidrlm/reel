@@ -69,7 +69,12 @@ def natural_key(name):
 
 
 def ext_of(uri_or_path):
-    path = GLib.filename_from_uri(uri_or_path)[0] if "://" in uri_or_path else uri_or_path
+    if uri_or_path.startswith("file://"):
+        path = GLib.filename_from_uri(uri_or_path)[0]
+    elif "://" in uri_or_path:
+        path = GLib.uri_unescape_string(uri_or_path.split("?")[0].split("#")[0], None) or uri_or_path
+    else:
+        path = uri_or_path
     return os.path.splitext(path)[1].lower()
 
 
@@ -434,6 +439,14 @@ class Window(Adw.ApplicationWindow):
     # ---- opening ----------------------------------------------------------------------
 
     def open_files(self, files, subtitle=None, title=None):
+        try:
+            self._open_files(files, subtitle, title)
+        except Exception as e:  # never leave the user on a blank window without a reason
+            import traceback
+            traceback.print_exc()
+            self.toast(f"Couldn't open this: {e}")
+
+    def _open_files(self, files, subtitle, title):
         uris = [f.get_uri() for f in files]
         subs = [u for u in uris if ext_of(u) in SUB_EXT]
         media = [u for u in uris if ext_of(u) not in SUB_EXT]
