@@ -1,4 +1,4 @@
-"""Reel's Preferences window: General (playback, window, audio, data) and Subtitles (showing + style)."""
+"""Reel's Preferences window: General (storage) and Subtitles (style)."""
 import os
 import shutil
 
@@ -20,7 +20,7 @@ DEFAULTS = {
 }
 SUB_STYLE_KEYS = ("sub_font", "sub_scale", "sub_color", "sub_style", "sub_box_opacity", "sub_position")
 # Settings without a control any more: always their default, never read from the saved config.
-FIXED = ("resume", "seek_step", "hw_decode", "hide_after", "fit_window", "theme", "audio_lang",
+FIXED = ("resume", "autoplay_next", "seek_step", "hw_decode", "hide_after", "fit_window", "theme", "audio_lang",
          "subs_auto", "sub_lang", "sub_delay")
 
 LANGUAGES = [("", "From the file"), ("en", "English"), ("hi", "Hindi"), ("ml", "Malayalam"), ("ta", "Tamil"),
@@ -107,11 +107,6 @@ class Preferences(Adw.PreferencesDialog):
         d = self.cfg.data
         page = Adw.PreferencesPage(title="General", icon_name="preferences-system-symbolic")
 
-        playback = Adw.PreferencesGroup(title="Playback")
-        playback.add(self._bind_switch(Adw.SwitchRow(title="Play the next video automatically",
-                                                     subtitle="Continues with the next file in the same folder"),
-                                       "autoplay_next"))
-        page.add(playback)
 
         data = Adw.PreferencesGroup(title="Storage")
         self.cache_row = Adw.ActionRow(title="Saved AI subtitles")
