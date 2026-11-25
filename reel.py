@@ -15,6 +15,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gst, Gtk, Pango  # noqa: E402
 
 import ai  # noqa: E402
+import gamepad  # noqa: E402
 import prefs  # noqa: E402
 
 try:
@@ -40,6 +41,12 @@ MEDIA_EXT = VIDEO_EXT | AUDIO_EXT
 SUB_EXT = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".smi"}
 SPEEDS = ["0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0"]
 PLAY_FLAG_TEXT = 1 << 2
+PAD_HELP = {
+    "Play / pause": "A / ✕ or Start", "Fullscreen": "Y / △", "Leave fullscreen": "B / ○",
+    "Next subtitle / audio track": "X / □ · Select", "Back / forward": "D-pad or left stick ← →",
+    "Volume": "D-pad or left stick ↑ ↓", "Previous / next video": "LB / RB",
+    "Hold to rewind / fast-forward": "LT / RT",
+}
 AI_TRACK = 1000  # subtitle menu value for the AI subtitles
 TAP_GAP_MS = 280  # max gap between clicks of a double/triple click
 HOLD_MS = 400  # press this long on the left/right of the video to rewind/fast-forward
@@ -258,6 +265,8 @@ class Window(Adw.ApplicationWindow):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self._sub_css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
         self.player.pipe.connect("deep-element-added", self._on_element_added)
+        self.gamepads = gamepad.Gamepads(self._on_pad, self._on_pad_hold,
+                                         lambda name: self.toast(f"Gamepad connected: {name}"))
         self.apply_sub_style()
         self.player.set_volume(self.cfg.data["volume"], self.cfg.data["muted"])
         self._sync_volume_ui()
@@ -960,6 +969,45 @@ class Window(Adw.ApplicationWindow):
         self._poke()
         return True
 
+    # ---- gamepad ----------------------------------------------------------------------------
+
+    def _on_pad(self, name):
+        """A gamepad button. Gamepads aren't tied to window focus, so only act while Reel is focused."""
+        if not self.is_active():
+            return
+        if self.uri is None:
+            if name in ("a", "start"):
+                self.choose_files()
+            elif name == "y":
+                self.toggle_fullscreen()
+            return
+        step = self.cfg.data["seek_step"]
+        actions = {
+            "a": self.toggle, "start": self.toggle,
+            "y": self.toggle_fullscreen,
+            "b": lambda: self.unfullscreen() if self.is_fullscreen() else None,
+            "x": self.cycle_subtitle, "select": self.cycle_audio,
+            "left": lambda: self.seek_by(-step), "right": lambda: self.seek_by(step),
+            "up": lambda: self.set_volume(self.cfg.data["volume"] + 5),
+            "down": lambda: self.set_volume(self.cfg.data["volume"] - 5),
+            "lb": lambda: self.step_queue(-1), "rb": lambda: self.step_queue(1),
+        }
+        fn = actions.get(name)
+        if fn:
+            fn()
+            self._poke()
+
+    def _on_pad_hold(self, trigger, pressed):
+        """Hold LT / RT to rewind / fast-forward, like holding the mouse on the left / right of the video."""
+        side = "left" if trigger == "lt" else "right"
+        if pressed:
+            if self.is_active() and self.uri and not self._holding:
+                self._hold_started = time.monotonic()
+                self._start_hold(side)
+                self._poke()
+        elif self._holding == side:
+            self._end_hold()
+
     # Mouse on the video, split into thirds:
     #   middle: click = play/pause, double-click = fullscreen
     #   right/left: double-click = ±10 s (each further quick click adds 10 s more),
@@ -1174,6 +1222,9 @@ class Window(Adw.ApplicationWindow):
             ("Sound & Subtitles", [("Volume up / down", "Up Down"), ("Mute", "m"),
                                    ("Next subtitle track", "s"), ("Subtitle delay − / +", "g h"),
                                    ("Next audio track", "a")]),
+            ("Gamepad", [("Play / pause", ""), ("Fullscreen", ""), ("Leave fullscreen", ""),
+                         ("Next subtitle / audio track", ""), ("Back / forward", ""), ("Volume", ""),
+                         ("Previous / next video", ""), ("Hold to rewind / fast-forward", "")]),
             ("Window", [("Fullscreen", "f"), ("Leave fullscreen", "Escape"), ("Open file", "<Ctrl>o"),
                         ("Preferences", "<Ctrl>comma"),
                         ("Open network stream", "<Ctrl>l"), ("Quit", "<Ctrl>q")]),
@@ -1183,6 +1234,8 @@ class Window(Adw.ApplicationWindow):
             for label, accel in items:
                 if accel == "0…9":
                     section.add(Adw.ShortcutsItem(title=label, accelerator="0 9"))
+                elif title == "Gamepad":
+                    section.add(Adw.ShortcutsItem(title=label, subtitle=PAD_HELP[label]))
                 else:
                     section.add(Adw.ShortcutsItem(title=label, accelerator=accel))
             dialog.add(section)

@@ -36,6 +36,13 @@ Whisper is killed together with Reel.
 
 Run `reel [file|url] [--sub-file=FILE] [--title=TITLE]`.
 
+## Gamepad
+
+A / ✕ or Start play/pause · Y / △ fullscreen · B / ○ leave fullscreen · X / □ next subtitle track ·
+Select next audio track · D-pad or left stick ←/→ seek, ↑/↓ volume (repeat while held) · LB / RB previous/next
+video · hold LT / RT rewind / fast-forward. Works with any pad libmanette knows (Xbox, PlayStation, Switch,
+generic); only while Reel's window is focused.
+
 ## Keys
 
 Space play/pause · ←/→ 10 s (Shift 3 s, Ctrl 1 min) · ↑/↓ volume · M mute · F fullscreen ·
