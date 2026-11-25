@@ -36,6 +36,8 @@ SUB_EXT = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".smi"}
 SPEEDS = ["0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0"]
 PLAY_FLAG_TEXT = 1 << 2
 HIDE_AFTER_MS = 2500
+TAP_GAP_MS = 280  # max gap between clicks of a double/triple click
+HOLD_MS = 400  # press this long on the left/right of the video to rewind/fast-forward
 
 CSS = b"""
 .reel-stage { background: black; }
@@ -156,9 +158,12 @@ class Player:
         ok, dur = self.pipe.query_duration(Gst.Format.TIME)
         return dur / Gst.SECOND if ok and dur > 0 else None
 
-    def seek(self, seconds, accurate=True):
+    def seek(self, seconds, accurate=True, before=False):
         flags = Gst.SeekFlags.FLUSH
-        flags |= Gst.SeekFlags.ACCURATE if accurate else (Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.SNAP_NEAREST)
+        if accurate:
+            flags |= Gst.SeekFlags.ACCURATE
+        else:  # jump to a keyframe: fast, and "before" keeps rewinding from snapping forward again
+            flags |= Gst.SeekFlags.KEY_UNIT | (Gst.SeekFlags.SNAP_BEFORE if before else Gst.SeekFlags.SNAP_NEAREST)
         return self.pipe.seek(self.rate, Gst.Format.TIME, flags, Gst.SeekType.SET,
                               int(max(0, seconds) * Gst.SECOND), Gst.SeekType.NONE, -1)
 
@@ -225,6 +230,14 @@ class Window(Adw.ApplicationWindow):
         self.fitted_for = None
         self.ext_sub_name = None
         self._hide_id = self._flash_id = self._click_id = self._seek_id = 0
+        self._hold_id = self._hold_tick_id = 0
+        self._holding = None
+        self._press_zone = None
+        self._tap_count = self._tap_total = 0
+        self._last_release = 0.0
+        self._hold_started = self._rewind_pos = 0.0
+        self._hold_rate = 1.0
+        self._hold_was_playing = False
         self._inhibit = 0
         self._last_user_seek = 0.0
         self._last_motion = None
@@ -303,9 +316,12 @@ class Window(Adw.ApplicationWindow):
         self.stack.add_named(stage, "player")
         self.view.set_content(self.stack)
 
-        click = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
-        click.connect("pressed", self._on_stage_click)
-        stage.add_controller(click)
+        # press/release on the video drives tap zones and hold-to-seek (see _on_press)
+        press = Gtk.GestureDrag(button=Gdk.BUTTON_PRIMARY)
+        press.connect("drag-begin", self._on_press)
+        press.connect("drag-end", self._on_release)
+        press.connect("cancel", self._on_release)
+        stage.add_controller(press)
         scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
         scroll.connect("scroll", self._on_scroll)
         stage.add_controller(scroll)
@@ -918,19 +934,115 @@ class Window(Adw.ApplicationWindow):
         self._poke()
         return True
 
-    def _on_stage_click(self, gesture, n_press, _x, _y):
+    # Mouse on the video, split into thirds:
+    #   middle: click = play/pause, double-click = fullscreen
+    #   right/left: double-click = ±10 s (each further quick click adds 10 s more),
+    #               hold = fast-forward (2×, then 4×) / rewind, until released
+
+    def _zone(self, x):
+        width = self.stage.get_width() or 1
+        return "left" if x < width / 3 else "right" if x > width * 2 / 3 else "center"
+
+    def _on_press(self, _gesture, x, _y):
+        self._poke()
+        if not self.uri:
+            return
+        now = time.monotonic()
+        zone = self._zone(x)
         if self._click_id:
             GLib.source_remove(self._click_id)
             self._click_id = 0
-        if n_press == 2:
-            self.toggle_fullscreen()
-        elif n_press == 1:
-            self._click_id = GLib.timeout_add(250, self._single_click)
+        if now - self._last_release < TAP_GAP_MS / 1000 and zone == self._press_zone:
+            self._tap_count += 1
+        else:
+            self._tap_count = 1
+        self._press_zone = zone
+        if self._tap_count >= 2:
+            if zone != "center":
+                self._tap_seek(zone)
+            elif self._tap_count == 2:
+                self.toggle_fullscreen()
+            return
+        if zone != "center":
+            self._hold_id = GLib.timeout_add(HOLD_MS, self._start_hold, zone)
+
+    def _on_release(self, *_):
+        if self._hold_id:
+            GLib.source_remove(self._hold_id)
+            self._hold_id = 0
+        if self._holding:
+            self._end_hold()
+            self._tap_count = 0
+            self._last_release = 0
+            return
+        self._last_release = time.monotonic()
+        if self._tap_count == 1 and self._press_zone == "center" and self.uri:
+            # wait briefly: a second click means fullscreen instead
+            self._click_id = GLib.timeout_add(TAP_GAP_MS, self._single_click)
 
     def _single_click(self):
         self._click_id = 0
         self.toggle()
         return GLib.SOURCE_REMOVE
+
+    def _tap_seek(self, zone):
+        sign = 1 if zone == "right" else -1
+        self._tap_total = 10 if self._tap_count == 2 else self._tap_total + 10
+        self.seek_by(10 * sign)
+        self._flash(f"{self._tap_total} s  ▶▶" if sign > 0 else f"◀◀  {self._tap_total} s", side=zone)
+
+    def _start_hold(self, zone):
+        self._hold_id = 0
+        self._holding = zone
+        self._hold_started = time.monotonic()
+        self._hold_was_playing = self.want_play and not self.ended
+        if zone == "right":
+            self._hold_rate = self.player.rate
+            self.ended = False
+            self.player.set_rate(2.0)
+            if not self._hold_was_playing:
+                self.player.set_state(Gst.State.PLAYING)
+            self._flash("2×  ▶▶", side=zone, ms=0)
+            self._hold_tick_id = GLib.timeout_add(250, self._hold_tick)
+        else:
+            self.player.set_state(Gst.State.PAUSED)
+            self._rewind_pos = self.player.position() or 0
+            self._hold_tick()
+            self._hold_tick_id = GLib.timeout_add(150, self._hold_tick)
+        return GLib.SOURCE_REMOVE
+
+    def _hold_tick(self):
+        held = time.monotonic() - self._hold_started
+        if self._holding == "right":
+            if held > 2 and self.player.rate < 4:
+                self.player.set_rate(4.0)
+                self._flash("4×  ▶▶", side="right", ms=0)
+            return GLib.SOURCE_CONTINUE
+        step = 0.5 if held < 1.5 else 2 if held < 4 else 5  # about 3×, then 13×, then 33× backwards
+        self._rewind_pos = max(0, self._rewind_pos - step)
+        self.ended = False
+        self.player.seek(self._rewind_pos, accurate=False, before=True)
+        self._last_user_seek = time.monotonic()
+        self.seekbar.set_value(self._rewind_pos)
+        self.pos_label.set_label(fmt_time(self._rewind_pos))
+        self._flash(f"◀◀  {fmt_time(self._rewind_pos)}", side="left", ms=0)
+        return GLib.SOURCE_CONTINUE
+
+    def _end_hold(self):
+        zone, self._holding = self._holding, None
+        if self._hold_tick_id:
+            GLib.source_remove(self._hold_tick_id)
+            self._hold_tick_id = 0
+        if zone == "right":
+            self.player.set_rate(self._hold_rate)
+            if not self._hold_was_playing:
+                self.player.set_state(Gst.State.PAUSED)
+        else:
+            self.player.seek(self._rewind_pos)
+            self._last_user_seek = time.monotonic()
+            if self._hold_was_playing:
+                self.player.set_state(Gst.State.PLAYING)
+        self._hide_flash()
 
     def _on_scroll(self, _ctl, _dx, dy):
         self._scroll_acc += dy
@@ -1058,14 +1170,27 @@ class Window(Adw.ApplicationWindow):
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=4))
 
-    def _flash(self, text):
+    def _flash(self, text, side=None, ms=900):
+        """Show a short message on the video; side="left"/"right" puts it on that side, ms=0 keeps it up."""
         self.flash.set_label(text)
+        self.flash.set_halign({"left": Gtk.Align.START, "right": Gtk.Align.END}.get(side, Gtk.Align.CENTER))
+        self.flash.set_margin_start(48 if side == "left" else 0)
+        self.flash.set_margin_end(48 if side == "right" else 0)
         self.flash.set_visible(True)
         if self._flash_id:
             GLib.source_remove(self._flash_id)
-        self._flash_id = GLib.timeout_add(900, self._hide_flash)
+            self._flash_id = 0
+        if ms:
+            self._flash_id = GLib.timeout_add(ms, self._flash_timeout)
+
+    def _flash_timeout(self):
+        self._flash_id = 0
+        self.flash.set_visible(False)
+        return GLib.SOURCE_REMOVE
 
     def _hide_flash(self):
+        if self._flash_id:
+            GLib.source_remove(self._flash_id)
         self._flash_id = 0
         self.flash.set_visible(False)
         return GLib.SOURCE_REMOVE

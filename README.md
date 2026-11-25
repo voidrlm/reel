@@ -3,7 +3,10 @@
 A simple video and music player for GNOME (GTK 4 + libadwaita + GStreamer).
 
 - Plays anything GStreamer can decode; uses VA-API hardware decoding (H.264, H.265, VP9, AV1) when available
-- Controls fade away while a video plays; click to pause, double-click for fullscreen, scroll for volume
+- Controls fade away while a video plays; scroll for volume
+- Mouse on the video: click the middle to pause/play (double-click: fullscreen); double-click the right/left third
+  to skip ±10 s (each further quick click adds 10 s); hold the right side to fast-forward (2×, then 4×) and the
+  left side to rewind, until you let go
 - Audio tracks, embedded and external subtitles (auto-loads a matching `.srt` next to the video), speed 0.5–2×
 - Remembers where you stopped in long videos
 - Previous/next walk through the other videos in the same folder; open several files to play them in a row
