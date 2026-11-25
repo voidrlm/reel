@@ -242,6 +242,7 @@ class Job:
         self.tmp = os.path.join(CACHE_DIR, "tmp", f"{os.getpid()}-{id(self)}")
         self.token = f"{os.getpid()}-{id(self)}-{time.time():.6f}"
         self.dec = self.sink = None
+        self._refocus = False
 
     def start(self):
         self._claim()  # from now on any older job (in any Reel window or process) stops itself
@@ -268,13 +269,19 @@ class Job:
         except OSError:
             pass
 
-    def _watch(self, proc):
-        """Kill whisper as soon as this job is cancelled or another video's job takes over."""
+    def _watch(self, proc, index):
+        """Kill whisper as soon as this job is cancelled or another video's job takes over, or when the
+        viewer jumped to a part that isn't transcribed yet (that minute is started right away instead)."""
         while proc.poll() is None:
             if self.cancelled or self._superseded():
                 proc.kill()
                 return
-            time.sleep(0.5)
+            want = int(max(0, self.focus) // CHUNK)
+            if want != index and want not in self.chunks and want < self.n_chunks:
+                self._refocus = True
+                proc.kill()
+                return
+            time.sleep(0.25)
 
     def cancel(self):
         self.cancelled = True
@@ -410,8 +417,9 @@ class Job:
             w.setsampwidth(2)
             w.setframerate(16000)
             w.writeframes(pcm)
+        # greedy decoding (-bs 1 -bo 1): ~2-3x faster than whisper-cli's default 5-way beam search
         cmd = [cli, "-m", model, "-f", wav, "-l", "auto", "-t", str(threads_to_use()),
-               "-np", "-mc", "0", "--suppress-nst"]
+               "-bs", "1", "-bo", "1", "-np", "-mc", "0", "--suppress-nst"]
         if vad:
             cmd += ["--vad", "-vm", vad]
         if self.translate:
@@ -422,7 +430,8 @@ class Job:
         with open(errlog, "w") as err:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, stdin=subprocess.DEVNULL,
                                          text=True, errors="replace", preexec_fn=_child_setup)
-            threading.Thread(target=self._watch, args=(self.proc,), daemon=True, name="reel-ai-watch").start()
+            self._refocus = False
+            threading.Thread(target=self._watch, args=(self.proc, index), daemon=True, name="reel-ai-watch").start()
             for line in self.proc.stdout:
                 m = _LINE.match(line.strip())
                 if not m:
@@ -439,6 +448,8 @@ class Job:
         took = time.monotonic() - began
         self.proc = None
         self._check()
+        if self._refocus:
+            return None, 0.0  # abandoned for the part being watched; this minute is redone later
         if rc != 0:
             try:
                 with open(errlog, errors="replace") as f:
@@ -490,6 +501,8 @@ class Job:
                 if index is None:
                     break
                 cues, took = self._transcribe(index, cli, model, vad)
+                if cues is None:
+                    continue
                 self.chunks[index] = cues
                 self._emit(1, index, cues)
                 self._save_cache()

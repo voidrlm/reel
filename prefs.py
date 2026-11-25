@@ -8,7 +8,7 @@ import ai
 
 DEFAULTS = {
     # playback
-    "resume": True, "autoplay_next": False, "seek_step": 10, "hw_decode": True,
+    "resume": False, "autoplay_next": False, "seek_step": 10, "hw_decode": True,
     # window
     "hide_after": 2.5, "fit_window": True, "theme": "dark",
     # audio
@@ -18,7 +18,10 @@ DEFAULTS = {
     "sub_font": "Sans Semi-Bold", "sub_scale": 1.0, "sub_color": "#ffffff",
     "sub_style": "outline", "sub_box_opacity": 0.55, "sub_position": 0.05,
 }
-SUB_STYLE_KEYS = ("sub_font", "sub_scale", "sub_color", "sub_style", "sub_box_opacity", "sub_position", "sub_delay")
+SUB_STYLE_KEYS = ("sub_font", "sub_scale", "sub_color", "sub_style", "sub_box_opacity", "sub_position")
+# Settings without a control any more: always their default, never read from the saved config.
+FIXED = ("resume", "seek_step", "hw_decode", "hide_after", "fit_window", "theme", "audio_lang",
+         "subs_auto", "sub_lang", "sub_delay")
 
 LANGUAGES = [("", "From the file"), ("en", "English"), ("hi", "Hindi"), ("ml", "Malayalam"), ("ta", "Tamil"),
              ("te", "Telugu"), ("kn", "Kannada"), ("bn", "Bengali"), ("mr", "Marathi"), ("ur", "Urdu"),
@@ -105,43 +108,12 @@ class Preferences(Adw.PreferencesDialog):
         page = Adw.PreferencesPage(title="General", icon_name="preferences-system-symbolic")
 
         playback = Adw.PreferencesGroup(title="Playback")
-        playback.add(self._bind_switch(Adw.SwitchRow(title="Resume where you left off",
-                                                     subtitle="For videos longer than two minutes"), "resume"))
         playback.add(self._bind_switch(Adw.SwitchRow(title="Play the next video automatically",
                                                      subtitle="Continues with the next file in the same folder"),
                                        "autoplay_next"))
-        steps = SEEK_STEPS if d["seek_step"] in SEEK_STEPS else SEEK_STEPS + [d["seek_step"]]
-        playback.add(self._bind_combo(
-            _combo("Skip length", [f"{s} seconds" for s in steps], steps.index(d["seek_step"]),
-                   "Arrow keys and double-click on the sides of the video"), "seek_step", steps))
-        playback.add(self._bind_switch(Adw.SwitchRow(title="Hardware video decoding",
-                                                     subtitle="Uses the graphics chip. Turn off only if videos "
-                                                              "show glitches or green frames"), "hw_decode"))
         page.add(playback)
 
-        window = Adw.PreferencesGroup(title="Window")
-        hides = HIDE_AFTER if d["hide_after"] in HIDE_AFTER else HIDE_AFTER + [d["hide_after"]]
-        window.add(self._bind_combo(_combo("Hide controls after", [f"{h:g} seconds" for h in hides],
-                                           hides.index(d["hide_after"])), "hide_after", hides))
-        window.add(self._bind_switch(Adw.SwitchRow(title="Resize the window to fit the video"), "fit_window"))
-        keys = [k for k, _ in THEMES]
-        window.add(self._bind_combo(_combo("Appearance", [n for _, n in THEMES],
-                                           keys.index(d["theme"]) if d["theme"] in keys else 0), "theme", keys))
-        page.add(window)
-
-        audio = Adw.PreferencesGroup(title="Audio")
-        codes = [c for c, _ in LANGUAGES]
-        audio.add(self._bind_combo(_combo("Preferred audio language", [n for _, n in LANGUAGES],
-                                          codes.index(d["audio_lang"]) if d["audio_lang"] in codes else 0,
-                                          "Picked when a video has several audio tracks"), "audio_lang", codes))
-        page.add(audio)
-
         data = Adw.PreferencesGroup(title="Storage")
-        self.history_row = Adw.ActionRow(title="Watch history")
-        btn = Gtk.Button(label="Clear", valign=Gtk.Align.CENTER)
-        btn.connect("clicked", self._clear_history)
-        self.history_row.add_suffix(btn)
-        data.add(self.history_row)
         self.cache_row = Adw.ActionRow(title="Saved AI subtitles")
         btn = Gtk.Button(label="Delete", valign=Gtk.Align.CENTER)
         btn.connect("clicked", self._clear_ai_cache)
@@ -158,9 +130,6 @@ class Preferences(Adw.PreferencesDialog):
         return page
 
     def _refresh_storage(self):
-        n = len(self.cfg.data.get("positions", {}))
-        self.history_row.set_subtitle(f"{n} video{'s' if n != 1 else ''} with a saved position" if n
-                                      else "Nothing saved")
         cache = sum(os.path.getsize(os.path.join(ai.CACHE_DIR, f)) for f in os.listdir(ai.CACHE_DIR)
                     if f.endswith(".json")) if os.path.isdir(ai.CACHE_DIR) else 0
         self.cache_row.set_subtitle(human(cache) if cache else "Nothing saved")
@@ -168,12 +137,6 @@ class Preferences(Adw.PreferencesDialog):
         engine = "AI engine installed" if ai.whisper_cli() else "AI engine not installed"
         self.models_row.set_subtitle(f"{human(models)} · {engine} · this PC uses “{ai.pick_model()}”"
                                      if models else f"None downloaded · {engine}")
-
-    def _clear_history(self, _btn):
-        self.cfg.data["positions"] = {}
-        self.cfg.save()
-        self._refresh_storage()
-        self.add_toast(Adw.Toast(title="Watch history cleared"))
 
     def _clear_ai_cache(self, _btn):
         if os.path.isdir(ai.CACHE_DIR):
@@ -220,23 +183,6 @@ class Preferences(Adw.PreferencesDialog):
         preview_group.add(frame)
         page.add(preview_group)
 
-        showing = Adw.PreferencesGroup(title="Showing")
-        showing.add(self._bind_switch(Adw.SwitchRow(title="Show subtitles automatically",
-                                                    subtitle="When a video has subtitles or a matching .srt file"),
-                                      "subs_auto"))
-        codes = [c for c, _ in LANGUAGES]
-        showing.add(self._bind_combo(_combo("Preferred subtitle language", [n for _, n in LANGUAGES],
-                                            codes.index(d["sub_lang"]) if d["sub_lang"] in codes else 0),
-                                     "sub_lang", codes))
-        delay = Adw.SpinRow.new_with_range(-30, 30, 0.1)
-        delay.set_title("Delay")
-        delay.set_subtitle("Seconds. More shows subtitles later. Keys G and H")
-        delay.set_digits(1)
-        delay.set_value(d["sub_delay"])
-        delay.connect("notify::value", lambda r, _p: self._set("sub_delay", round(r.get_value(), 2)))
-        self.delay_row = delay
-        showing.add(delay)
-        page.add(showing)
 
         style = Adw.PreferencesGroup(title="Style")
         font_row = Adw.ActionRow(title="Font")
@@ -325,7 +271,6 @@ class Preferences(Adw.PreferencesDialog):
         self.size_scale.set_value(DEFAULTS["sub_scale"] * 100)
         self.box_scale.set_value(DEFAULTS["sub_box_opacity"] * 100)
         self.pos_scale.set_value(DEFAULTS["sub_position"] * 100)
-        self.delay_row.set_value(DEFAULTS["sub_delay"])
         self.style_row.set_selected([k for k, _ in SUB_STYLES].index(DEFAULTS["sub_style"]))
         self.cfg.save()
         self.win.on_setting_changed("sub_style")
@@ -335,11 +280,6 @@ class Preferences(Adw.PreferencesDialog):
         self.preview.set_margin_bottom(int(8 + 150 * self.cfg.data["sub_position"]))
         self.preview.set_margin_start(12)
         self.preview.set_margin_end(12)
-
-    def show_delay(self, value):
-        """Keep the spin row in step when the delay is changed with G/H while the dialog is open."""
-        if abs(self.delay_row.get_value() - value) > 1e-6:
-            self.delay_row.set_value(value)
 
 
 def apply_theme(theme):

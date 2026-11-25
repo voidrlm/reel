@@ -98,12 +98,15 @@ def display_name(uri):
 class Config:
     def __init__(self):
         self.path = os.path.join(CONFIG_DIR, "config.json")
-        self.data = {"volume": 80, "muted": False, "positions": {}, **prefs.DEFAULTS}
+        self.data = {"volume": 80, "muted": False, **prefs.DEFAULTS}
         try:
             with open(self.path) as f:
                 self.data.update(json.load(f))
         except (OSError, ValueError):
             pass
+        for key in prefs.FIXED:
+            self.data[key] = prefs.DEFAULTS[key]
+        self.data.pop("positions", None)  # watch history is never kept
 
     def save(self):
         try:
@@ -114,20 +117,6 @@ class Config:
             os.replace(tmp, self.path)
         except OSError:
             pass
-
-    def remember(self, uri, pos, dur):
-        positions = self.data["positions"]
-        if dur > 120 and 15 < pos < dur - 25:
-            positions[uri] = [round(pos, 1), time.time()]
-            if len(positions) > 300:
-                for old in sorted(positions, key=lambda k: positions[k][1])[:50]:
-                    del positions[old]
-        else:
-            positions.pop(uri, None)
-
-    def resume_point(self, uri):
-        entry = self.data["positions"].get(uri)
-        return entry[0] if entry else 0
 
 
 class Player:
@@ -560,11 +549,13 @@ class Window(Adw.ApplicationWindow):
         return Gio.File.new_for_path(pick).get_uri() if pick else None
 
     def load(self, uri, subtitle=None, title=None, resume=None):
-        self._save_position()
         p = self.player
         p.set_state(Gst.State.NULL)
         if uri != self.uri:
             self._reset_ai()
+            if self.cfg.data["sub_delay"]:
+                self.cfg.data["sub_delay"] = 0.0
+                self.apply_sub_style()
         self.uri = uri
         self.title_override = title
         sub = subtitle or self._find_subtitle(uri)
@@ -580,8 +571,8 @@ class Window(Adw.ApplicationWindow):
         self.prerolled = False
         self.ended = False
         self.has_video = False
-        start = (self.cfg.resume_point(uri) if self.cfg.data['resume'] else 0) if resume is None else resume
-        self.pending_seek = (start, resume is None) if start else None
+        start = resume or 0
+        self.pending_seek = start or None
         self.want_play = True
         self.seekbar.set_range(0, 1)
         self.seekbar.set_value(0)
@@ -623,7 +614,6 @@ class Window(Adw.ApplicationWindow):
     def pause(self):
         self.want_play = False
         self.player.set_state(Gst.State.PAUSED)
-        self._save_position()
 
     def toggle(self):
         if self.want_play and not self.ended:
@@ -777,7 +767,6 @@ class Window(Adw.ApplicationWindow):
         if self.ai_label:
             subs.append(self.ai_label, f"win.subtitle({AI_TRACK})")
         subs.append("Load from File…", "win.load-subtitle")
-        subs.append("Style & Delay…", "win.sub-style")
         if self.ai_job or self.ai_installer:
             subs.append("Stop Generating", "win.ai-stop")
         else:
@@ -861,23 +850,16 @@ class Window(Adw.ApplicationWindow):
         self._restore_ai()
         self._rebuild_tracks()
         if self.pending_seek:
-            start, announce = self.pending_seek
+            start = self.pending_seek  # only when reopening the same video (new subtitle file, decoder change)
             self.pending_seek = None
             dur = self.player.duration()
             if not dur or start < dur - 5:
                 self.player.seek(start)
-                if announce:
-                    toast = Adw.Toast(title=f"Resumed from {fmt_time(start)}", button_label="Start Over",
-                                      timeout=6)
-                    toast.connect("button-clicked", lambda *_: self.player.seek(0))
-                    self.toasts.add_toast(toast)
         if self.want_play and not self.buffering:
             self.player.set_state(Gst.State.PLAYING)
         self._update_inhibit()
 
     def _on_eos(self):
-        if self.uri:
-            self.cfg.data["positions"].pop(self.uri, None)
         if self.autoadvance and self.index + 1 < len(self.queue):
             self.play_index(self.index + 1)
             return
@@ -929,13 +911,6 @@ class Window(Adw.ApplicationWindow):
         scale = min(geo.width * 0.75 / w, geo.height * 0.75 / h)
         scale = min(scale, max(1.0, 640 / w))  # small videos are enlarged up to 640 px wide
         self.set_default_size(round(w * scale), round(h * scale))
-
-    def _save_position(self):
-        if self.uri and self.prerolled and not self.ended and self.cfg.data["resume"]:
-            pos, dur = self.player.position(), self.player.duration()
-            if pos is not None and dur:
-                self.cfg.remember(self.uri, pos, dur)
-                self.cfg.save()
 
     # ---- input --------------------------------------------------------------------------
 
@@ -1303,11 +1278,8 @@ class Window(Adw.ApplicationWindow):
 
     def change_sub_delay(self, delta):
         value = round(self.cfg.data["sub_delay"] + delta, 2)
-        self.cfg.data["sub_delay"] = value
+        self.cfg.data["sub_delay"] = value  # for this video only (not saved; reset when another opens)
         self.apply_sub_style()
-        self.cfg.save()
-        if self._prefs:
-            self._prefs.show_delay(value)
         self._flash(f"Subtitle delay {value:+.1f} s")
 
     def _track_lang(self, kind, index):
@@ -1551,7 +1523,6 @@ class Window(Adw.ApplicationWindow):
 
     def _on_close(self, *_):
         """Closing the window ends Reel completely, even if something below hangs."""
-        self._save_position()
         self.cfg.save()
         if self.ai_job:
             self.ai_job.cancel()

@@ -8,7 +8,6 @@ A simple video and music player for GNOME (GTK 4 + libadwaita + GStreamer).
   to skip ±10 s (each further quick click adds 10 s); hold the right side to fast-forward (2×, then 4×) and the
   left side to rewind, until you let go
 - Audio tracks, embedded and external subtitles (auto-loads a matching `.srt` next to the video), speed 0.5–2×
-- Remembers where you stopped in long videos
 - **Generate subtitles with AI** (Subtitles menu): Whisper runs on this computer, nothing is uploaded.
   Reel picks the model from the PC's hardware (tiny / base / small / medium by cores, memory and
   AVX2/AVX-512/NEON), steps down by itself if the PC can't keep ahead of playback, transcribes the minutes
@@ -20,12 +19,12 @@ A simple video and music player for GNOME (GTK 4 + libadwaita + GStreamer).
 
 ## Preferences (Ctrl+,)
 
-- **General**: resume where you left off, play the next video in the folder automatically, skip length,
-  hardware decoding, hide-controls delay, fit window to video, appearance (dark / system / light),
-  preferred audio language, clear watch history / saved AI subtitles / AI models
-- **Subtitles**: show automatically, preferred language, delay (also G / H keys), font, size, colour,
-  outline / shadow / dark box, box darkness, distance from the bottom, with a live preview.
-  The style applies to embedded, .srt and AI subtitles alike.
+- **General**: play the next video in the folder automatically; delete saved AI subtitles / AI models
+- **Subtitles**: font, size, colour, outline / shadow / dark box, box darkness, distance from the bottom,
+  with a live preview. Applies to embedded, .srt and AI subtitles alike. G / H shift the subtitle timing
+  for the current video.
+
+No watch history is kept.
 
 Only one AI subtitle job runs at a time, across all Reel windows: starting one stops any other, and
 Whisper is killed together with Reel.
