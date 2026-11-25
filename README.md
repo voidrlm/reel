@@ -18,6 +18,18 @@ A simple video and music player for GNOME (GTK 4 + libadwaita + GStreamer).
 - Previous/next walk through the other videos in the same folder; open several files to play them in a row
 - Network streams (http, HLS, rtsp)
 
+## Preferences (Ctrl+,)
+
+- **General**: resume where you left off, play the next video in the folder automatically, skip length,
+  hardware decoding, hide-controls delay, fit window to video, appearance (dark / system / light),
+  preferred audio language, clear watch history / saved AI subtitles / AI models
+- **Subtitles**: show automatically, preferred language, delay (also G / H keys), font, size, colour,
+  outline / shadow / dark box, box darkness, distance from the bottom, with a live preview.
+  The style applies to embedded, .srt and AI subtitles alike.
+
+Only one AI subtitle job runs at a time, across all Reel windows: starting one stops any other, and
+Whisper is killed together with Reel.
+
 ## Install
 
     ./install.sh            # launcher + app-grid entry

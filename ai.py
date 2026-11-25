@@ -5,6 +5,7 @@ stepped down automatically if this PC turns out too slow to stay ahead of playba
 playback position are done first, so subtitles show up while watching; finished minutes are cached, so
 reopening the video (or generating again) continues where it stopped.
 """
+import ctypes
 import hashlib
 import json
 import math
@@ -12,6 +13,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -27,6 +29,7 @@ DATA_DIR = os.environ.get("REEL_DATA_DIR", os.path.join(GLib.get_user_data_dir()
 CACHE_DIR = os.environ.get("REEL_AI_CACHE", os.path.join(GLib.get_user_cache_dir(), "reel", "ai"))
 INSTALLER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "install-ai.sh")
 PROFILE = os.path.join(DATA_DIR, "ai-profile.json")
+ACTIVE = os.path.join(CACHE_DIR, "active-job")  # token of the one job allowed to run, across all Reel processes
 _HF = "https://huggingface.co/"
 # lightest first: (key, file, download size in MB)
 MODELS = [
@@ -44,6 +47,19 @@ _NOISE = re.compile(r"^\W*(blank_audio|silence|no speech|inaudible)?\W*$", re.I)
 
 class Cancelled(Exception):
     pass
+
+
+class Superseded(Exception):
+    pass
+
+
+def _child_setup():
+    """Runs in whisper-cli before exec: low priority, and killed if Reel's worker thread goes away."""
+    os.nice(10)
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
 
 
 # ---- hardware → model ----------------------------------------------------------------------
@@ -187,6 +203,22 @@ def load_cached_cues(uri, translate):
         return {}
 
 
+def _clean_stale_tmp():
+    """Remove work folders left by Reel processes that no longer exist."""
+    root = os.path.join(CACHE_DIR, "tmp")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        try:
+            pid = int(name.split("-", 1)[0])
+        except ValueError:
+            continue
+        if pid != os.getpid() and not os.path.exists(f"/proc/{pid}"):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
 # ---- the job ----------------------------------------------------------------------------
 
 class Job:
@@ -208,10 +240,41 @@ class Job:
         self.model = pick_model()
         self.cache_path = _cache_path(uri, translate)
         self.tmp = os.path.join(CACHE_DIR, "tmp", f"{os.getpid()}-{id(self)}")
+        self.token = f"{os.getpid()}-{id(self)}-{time.time():.6f}"
         self.dec = self.sink = None
 
     def start(self):
+        self._claim()  # from now on any older job (in any Reel window or process) stops itself
         threading.Thread(target=self._run, daemon=True, name="reel-ai").start()
+
+    def _claim(self):
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = f"{ACTIVE}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            f.write(self.token)
+        os.replace(tmp, ACTIVE)
+
+    def _superseded(self):
+        try:
+            with open(ACTIVE) as f:
+                return f.read().strip() != self.token
+        except OSError:
+            return True  # the claim was removed: nobody may run
+
+    def _release(self):
+        try:
+            if not self._superseded():
+                os.remove(ACTIVE)
+        except OSError:
+            pass
+
+    def _watch(self, proc):
+        """Kill whisper as soon as this job is cancelled or another video's job takes over."""
+        while proc.poll() is None:
+            if self.cancelled or self._superseded():
+                proc.kill()
+                return
+            time.sleep(0.5)
 
     def cancel(self):
         self.cancelled = True
@@ -233,6 +296,8 @@ class Job:
     def _check(self):
         if self.cancelled:
             raise Cancelled()
+        if self._superseded():
+            raise Superseded()
 
     def _download(self, url, dest, label):
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -356,7 +421,8 @@ class Job:
         began = time.monotonic()
         with open(errlog, "w") as err:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, stdin=subprocess.DEVNULL,
-                                         text=True, errors="replace", preexec_fn=lambda: os.nice(10))
+                                         text=True, errors="replace", preexec_fn=_child_setup)
+            threading.Thread(target=self._watch, args=(self.proc,), daemon=True, name="reel-ai-watch").start()
             for line in self.proc.stdout:
                 m = _LINE.match(line.strip())
                 if not m:
@@ -408,6 +474,7 @@ class Job:
                 except (OSError, ValueError, RuntimeError):
                     vad = None  # optional: it only filters out silence and music
             self._check()
+            _clean_stale_tmp()
             os.makedirs(self.tmp, exist_ok=True)
             self._load_cache()
             self._status("Reading audio", 0)
@@ -432,10 +499,13 @@ class Job:
             self._emit(2)
         except Cancelled:
             pass
+        except Superseded:
+            self._emit(3, "another video is generating AI subtitles now")
         except Exception as e:  # noqa: BLE001 - shown to the user
             if not self.cancelled:
-                self._emit(3, str(e))
+                self._emit(3, "another video is generating AI subtitles now" if self._superseded() else str(e))
         finally:
+            self._release()
             if self.dec is not None:
                 self.dec.set_state(Gst.State.NULL)
             shutil.rmtree(self.tmp, ignore_errors=True)

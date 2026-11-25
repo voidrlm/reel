@@ -15,6 +15,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gst, Gtk, Pango  # noqa: E402
 
 import ai  # noqa: E402
+import prefs  # noqa: E402
 
 try:
     gi.require_version("GstPbutils", "1.0")
@@ -40,7 +41,6 @@ SUB_EXT = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".smi"}
 SPEEDS = ["0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0"]
 PLAY_FLAG_TEXT = 1 << 2
 AI_TRACK = 1000  # subtitle menu value for the AI subtitles
-HIDE_AFTER_MS = 2500
 TAP_GAP_MS = 280  # max gap between clicks of a double/triple click
 HOLD_MS = 400  # press this long on the left/right of the video to rewind/fast-forward
 
@@ -57,10 +57,9 @@ headerbar.reel-osd {
   color: white;
 }
 .reel-time { font-feature-settings: "tnum"; font-size: 0.92em; min-width: 3.6em; }
-.reel-aisub {
-  color: white; font-weight: 600; background: alpha(black, 0.55);
-  border-radius: 8px; padding: 2px 12px; text-shadow: 0 1px 3px black;
-}
+.reel-aisub { border-radius: 8px; padding: 2px 12px; }
+.reel-preview { background: linear-gradient(135deg, #3a4a5c, #1d2630 60%, #2b2220); }
+.reel-swatch { min-width: 26px; min-height: 26px; padding: 0; }
 .reel-flash {
   background: alpha(black, 0.6); color: white; border-radius: 14px;
   padding: 10px 20px; font-weight: bold; font-size: 1.25em;
@@ -99,7 +98,7 @@ def display_name(uri):
 class Config:
     def __init__(self):
         self.path = os.path.join(CONFIG_DIR, "config.json")
-        self.data = {"volume": 80, "muted": False, "positions": {}}
+        self.data = {"volume": 80, "muted": False, "positions": {}, **prefs.DEFAULTS}
         try:
             with open(self.path) as f:
                 self.data.update(json.load(f))
@@ -264,6 +263,13 @@ class Window(Adw.ApplicationWindow):
 
         self._build_ui()
         self._install_actions()
+        self._prefs = None
+        self._overlays = []  # textoverlay elements that draw embedded / .srt subtitles
+        self._sub_css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self._sub_css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        self.player.pipe.connect("deep-element-added", self._on_element_added)
+        self.apply_sub_style()
         self.player.set_volume(self.cfg.data["volume"], self.cfg.data["muted"])
         self._sync_volume_ui()
         self._set_mode(False)
@@ -291,6 +297,7 @@ class Window(Adw.ApplicationWindow):
         menu.append("Open File…", "win.open")
         menu.append("Open Network Stream…", "win.open-url")
         more = Gio.Menu()
+        more.append("Preferences", "win.preferences")
         more.append("Keyboard Shortcuts", "win.shortcuts")
         more.append("About Reel", "win.about")
         menu.append_section(None, more)
@@ -416,6 +423,8 @@ class Window(Adw.ApplicationWindow):
         add("shortcuts", self.show_shortcuts)
         add("about", self.show_about)
         add("ai-generate", self.choose_ai)
+        add("preferences", self.show_preferences)
+        add("sub-style", lambda: self.show_preferences("subtitles"))
         add("ai-stop", self.stop_ai)
 
         self.audio_action = Gio.SimpleAction.new_stateful("audio-track", GLib.VariantType("i"), GLib.Variant("i", 0))
@@ -457,7 +466,7 @@ class Window(Adw.ApplicationWindow):
         self._show_chrome(True)
         if self._hide_id:
             GLib.source_remove(self._hide_id)
-        self._hide_id = GLib.timeout_add(HIDE_AFTER_MS, self._auto_hide)
+        self._hide_id = GLib.timeout_add(int(self.cfg.data['hide_after'] * 1000), self._auto_hide)
 
     def _auto_hide(self):
         self._hide_id = 0
@@ -465,7 +474,7 @@ class Window(Adw.ApplicationWindow):
         if self.playing and self.has_video and not self._pointer_in_bars and not menus_open:
             self._show_chrome(False)
         elif self.playing:
-            self._hide_id = GLib.timeout_add(HIDE_AFTER_MS, self._auto_hide)
+            self._hide_id = GLib.timeout_add(int(self.cfg.data['hide_after'] * 1000), self._auto_hide)
         return GLib.SOURCE_REMOVE
 
     def _on_motion(self, _ctl, x, y):
@@ -508,7 +517,7 @@ class Window(Adw.ApplicationWindow):
             siblings = [Gio.File.new_for_path(os.path.join(folder, n)).get_uri() for n in names]
             if media[0] not in siblings:
                 siblings = [media[0]]
-            self.queue, self.autoadvance = siblings, False
+            self.queue, self.autoadvance = siblings, bool(self.cfg.data['autoplay_next'])
             index = siblings.index(media[0])
         else:
             self.queue, self.autoadvance = media, len(media) > 1
@@ -564,14 +573,14 @@ class Window(Adw.ApplicationWindow):
         p.pipe.props.uri = uri
         p.pipe.props.suburi = sub
         self.ext_sub_name = display_name(sub) if sub else None
-        self.pending_subtitle = "external" if sub else None
+        self.pending_subtitle = ("chosen" if subtitle else "found") if sub else None
         p.pipe.props.flags = p.pipe.props.flags | PLAY_FLAG_TEXT
         p.rate = 1.0
         self.speed_action.set_state(GLib.Variant("s", "1.0"))
         self.prerolled = False
         self.ended = False
         self.has_video = False
-        start = self.cfg.resume_point(uri) if resume is None else resume
+        start = (self.cfg.resume_point(uri) if self.cfg.data['resume'] else 0) if resume is None else resume
         self.pending_seek = (start, resume is None) if start else None
         self.want_play = True
         self.seekbar.set_range(0, 1)
@@ -768,6 +777,7 @@ class Window(Adw.ApplicationWindow):
         if self.ai_label:
             subs.append(self.ai_label, f"win.subtitle({AI_TRACK})")
         subs.append("Load from File…", "win.load-subtitle")
+        subs.append("Style & Delay…", "win.sub-style")
         if self.ai_job or self.ai_installer:
             subs.append("Stop Generating", "win.ai-stop")
         else:
@@ -846,8 +856,7 @@ class Window(Adw.ApplicationWindow):
             self.audio_page.set_title(self.title_override or display_name(self.uri))
             self.audio_page.set_description("")
             self.media_stack.set_visible_child_name("audio")
-        if self.pending_subtitle == "external" and pipe.props.n_text:
-            self.player.set_subtitle(pipe.props.n_text - 1)
+        self._apply_track_preferences()
         self.pending_subtitle = None
         self._restore_ai()
         self._rebuild_tracks()
@@ -903,7 +912,7 @@ class Window(Adw.ApplicationWindow):
 
     def _fit_window(self):
         """Size the window to the video once per file, so it opens without black borders."""
-        if self.fitted_for == self.uri or not self.has_video:
+        if self.fitted_for == self.uri or not self.has_video or not self.cfg.data["fit_window"]:
             return
         p = self.player.paintable
         w, h = p.get_intrinsic_width(), p.get_intrinsic_height()
@@ -922,7 +931,7 @@ class Window(Adw.ApplicationWindow):
         self.set_default_size(round(w * scale), round(h * scale))
 
     def _save_position(self):
-        if self.uri and self.prerolled and not self.ended:
+        if self.uri and self.prerolled and not self.ended and self.cfg.data["resume"]:
             pos, dur = self.player.position(), self.player.duration()
             if pos is not None and dur:
                 self.cfg.remember(self.uri, pos, dur)
@@ -939,6 +948,7 @@ class Window(Adw.ApplicationWindow):
         if ctrl and k not in ("Left", "Right"):
             return False
         has_media = self.uri is not None
+        step = self.cfg.data["seek_step"]
         actions = {
             "space": self.toggle, "k": self.toggle, "AudioPlay": self.toggle, "AudioPause": self.toggle,
             "f": self.toggle_fullscreen, "F11": self.toggle_fullscreen,
@@ -952,9 +962,10 @@ class Window(Adw.ApplicationWindow):
             "Down": lambda: self.set_volume(self.cfg.data["volume"] - 5),
             "AudioRaiseVolume": lambda: self.set_volume(self.cfg.data["volume"] + 5),
             "AudioLowerVolume": lambda: self.set_volume(self.cfg.data["volume"] - 5),
-            "Left": lambda: self.seek_by(-60 if ctrl else -3 if shift else -10),
-            "Right": lambda: self.seek_by(60 if ctrl else 3 if shift else 10),
-            "j": lambda: self.seek_by(-10), "l": lambda: self.seek_by(10),
+            "Left": lambda: self.seek_by(-60 if ctrl else -3 if shift else -step),
+            "Right": lambda: self.seek_by(60 if ctrl else 3 if shift else step),
+            "j": lambda: self.seek_by(-step), "l": lambda: self.seek_by(step),
+            "g": lambda: self.change_sub_delay(-0.1), "h": lambda: self.change_sub_delay(0.1),
             "Home": lambda: self.player.seek(0),
         }
         if k == "Escape" and self.is_fullscreen():
@@ -1027,8 +1038,9 @@ class Window(Adw.ApplicationWindow):
 
     def _tap_seek(self, zone):
         sign = 1 if zone == "right" else -1
-        self._tap_total = 10 if self._tap_count == 2 else self._tap_total + 10
-        self.seek_by(10 * sign)
+        step = self.cfg.data["seek_step"]
+        self._tap_total = step if self._tap_count == 2 else self._tap_total + step
+        self.seek_by(step * sign)
         self._flash(f"{self._tap_total} s  ▶▶" if sign > 0 else f"◀◀  {self._tap_total} s", side=zone)
 
     def _start_hold(self, zone):
@@ -1179,14 +1191,16 @@ class Window(Adw.ApplicationWindow):
     def show_shortcuts(self):
         dialog = Adw.ShortcutsDialog()
         groups = [
-            ("Playback", [("Play / Pause", "space"), ("Back / forward 10 s", "Left Right"),
+            ("Playback", [("Play / Pause", "space"), ("Back / forward (skip length)", "Left Right"),
                           ("Back / forward 3 s", "<Shift>Left <Shift>Right"),
                           ("Back / forward 1 min", "<Ctrl>Left <Ctrl>Right"),
                           ("Jump to 0–90 %", "0…9"), ("Slower / faster", "bracketleft bracketright"),
                           ("Normal speed", "equal"), ("Previous / next file", "p n")]),
             ("Sound & Subtitles", [("Volume up / down", "Up Down"), ("Mute", "m"),
-                                   ("Next subtitle track", "s"), ("Next audio track", "a")]),
+                                   ("Next subtitle track", "s"), ("Subtitle delay − / +", "g h"),
+                                   ("Next audio track", "a")]),
             ("Window", [("Fullscreen", "f"), ("Leave fullscreen", "Escape"), ("Open file", "<Ctrl>o"),
+                        ("Preferences", "<Ctrl>comma"),
                         ("Open network stream", "<Ctrl>l"), ("Quit", "<Ctrl>q")]),
         ]
         for title, items in groups:
@@ -1204,6 +1218,134 @@ class Window(Adw.ApplicationWindow):
                                 developer_name="Arjun",
                                 comments="A simple player for videos, music and streams.")
         about.present(self)
+
+    # ---- settings ---------------------------------------------------------------------------
+
+    def show_preferences(self, page=None):
+        dialog = prefs.Preferences(self)
+        if page:
+            dialog.set_visible_page_name(page)
+        self._prefs = dialog
+        dialog.connect("closed", lambda *_: setattr(self, "_prefs", None))
+        dialog.present(self)
+
+    def on_setting_changed(self, key):
+        if key.startswith("sub_"):
+            self.apply_sub_style()
+            if key == "sub_lang":
+                self._apply_track_preferences(only="text")
+        elif key == "subs_auto":
+            self._apply_track_preferences(only="text")
+        elif key == "audio_lang":
+            self._apply_track_preferences(only="audio")
+        elif key == "theme":
+            prefs.apply_theme(self.cfg.data["theme"])
+        elif key == "autoplay_next":
+            if len(self.queue) > 1 and self.uri and self.uri.startswith("file://"):
+                self.autoadvance = bool(self.cfg.data["autoplay_next"])
+        elif key == "hw_decode":
+            prefs.set_hardware_decoding(self.cfg.data["hw_decode"])
+            if self.uri and self.prerolled:  # reopen so the new decoder is used right away
+                pos = self.player.position() or 0
+                was_playing = self.want_play
+                self.load(self.uri, title=self.title_override, resume=pos)
+                self.want_play = was_playing
+        elif key == "fit_window" and self.cfg.data["fit_window"]:
+            self.fitted_for = None
+
+    def sub_attrs(self, px):
+        desc = Pango.FontDescription.from_string(self.cfg.data["sub_font"] or "Sans Semi-Bold")
+        desc.set_absolute_size(px * Pango.SCALE)
+        attrs = Pango.AttrList()
+        attrs.insert(Pango.attr_font_desc_new(desc))
+        return attrs
+
+    def apply_sub_style(self):
+        """Apply the subtitle style to Reel's own subtitle layer (AI) and to GStreamer's text overlays."""
+        d = self.cfg.data
+        color = d["sub_color"] if re.match(r"^#[0-9a-fA-F]{6}$", d["sub_color"] or "") else "#ffffff"
+        if d["sub_style"] == "box":
+            look = f"background: alpha(black, {d['sub_box_opacity']:.2f}); text-shadow: none;"
+        elif d["sub_style"] == "shadow":
+            look = "background: none; text-shadow: 0 2px 4px alpha(black, 0.9), 0 0 2px black;"
+        else:
+            look = ("background: none; text-shadow: -1px -1px 0 black, 1px -1px 0 black, -1px 1px 0 black, "
+                    "1px 1px 0 black, 0 0 4px black;")
+        self._sub_css.load_from_string(f".reel-aisub {{ color: {color}; {look} }}")
+        self._sub_px = 0
+        self.player.pipe.props.text_offset = int(d["sub_delay"] * Gst.SECOND)
+        self._overlays = [o for o in self._overlays if o.get_parent() is not None]
+        for overlay in self._overlays:
+            self._style_overlay(overlay)
+        if self._prefs:
+            self._prefs.update_preview()
+
+    def _style_overlay(self, overlay):
+        d = self.cfg.data
+        desc = Pango.FontDescription.from_string(d["sub_font"] or "Sans Semi-Bold")
+        desc.set_size(int(20 * d["sub_scale"] * Pango.SCALE))
+        r, g, b = (int(d["sub_color"][i:i + 2], 16) for i in (1, 3, 5)) if len(d["sub_color"]) == 7 else (255,) * 3
+        overlay.set_property("font-desc", desc.to_string())
+        overlay.set_property("color", (0xFF << 24) | (r << 16) | (g << 8) | b)
+        overlay.set_property("draw-outline", d["sub_style"] == "outline")
+        overlay.set_property("draw-shadow", d["sub_style"] == "shadow")
+        overlay.set_property("shaded-background", d["sub_style"] == "box")
+        overlay.set_property("shading-value", int(40 + d["sub_box_opacity"] * 215))
+        Gst.util_set_object_arg(overlay, "valignment", "bottom")
+        height = self.player.paintable.get_intrinsic_height() or 720
+        overlay.set_property("ypad", int(height * d["sub_position"]))
+
+    def _on_element_added(self, _bin, _sub_bin, element):
+        factory = element.get_factory()
+        if factory and factory.get_name() == "textoverlay":
+            self._overlays.append(element)
+            GLib.idle_add(lambda: (self._style_overlay(element), False)[1])
+
+    def change_sub_delay(self, delta):
+        value = round(self.cfg.data["sub_delay"] + delta, 2)
+        self.cfg.data["sub_delay"] = value
+        self.apply_sub_style()
+        self.cfg.save()
+        if self._prefs:
+            self._prefs.show_delay(value)
+        self._flash(f"Subtitle delay {value:+.1f} s")
+
+    def _track_lang(self, kind, index):
+        tags = self.player.pipe.emit(f"get-{kind}-tags", index)
+        if tags is None:
+            return None
+        ok, code = tags.get_string(Gst.TAG_LANGUAGE_CODE)
+        if not ok or not code:
+            return None
+        code = code.lower()
+        if GstTag and len(code) != 2:
+            code = GstTag.tag_get_language_code_iso_639_1(code) or code
+        return code
+
+    def _apply_track_preferences(self, only=None):
+        """Pick audio/subtitle tracks from the Preferences (language, show automatically)."""
+        pipe = self.player.pipe
+        d = self.cfg.data
+        if only in (None, "audio") and d["audio_lang"] and pipe.props.n_audio > 1:
+            for i in range(pipe.props.n_audio):
+                if self._track_lang("audio", i) == d["audio_lang"]:
+                    pipe.props.current_audio = i
+                    break
+        if only in (None, "text"):
+            n = pipe.props.n_text
+            chosen = self.pending_subtitle == "chosen"
+            if self.ai_show:
+                pass  # AI subtitles stay on
+            elif n and (chosen or (self.pending_subtitle == "found" and d["subs_auto"])):
+                self.player.set_subtitle(n - 1)  # the external file is added last
+            elif n and d["subs_auto"]:
+                pick = next((i for i in range(n) if d["sub_lang"] and self._track_lang("text", i) == d["sub_lang"]),
+                            None)
+                self.player.set_subtitle(pick if pick is not None else max(0, pipe.props.current_text))
+            else:
+                self.player.set_subtitle(-1)
+        if only:
+            self._rebuild_tracks()
 
     # ---- AI subtitles -----------------------------------------------------------------------
 
@@ -1314,7 +1456,7 @@ class Window(Adw.ApplicationWindow):
         self.ai_chunks = ai.load_cached_cues(self.uri, translate)
         self._merge_ai_cues()
         self.ai_label = "AI · English" if translate else "AI subtitles"
-        if not self.player.subtitles_on() or not self.player.pipe.props.n_text:
+        if self.cfg.data["subs_auto"] and (not self.player.subtitles_on() or not self.player.pipe.props.n_text):
             self.ai_show = True
             self.player.set_subtitle(-1)
 
@@ -1357,6 +1499,7 @@ class Window(Adw.ApplicationWindow):
             self.ai_job.focus = pos
         text = ""
         if self.ai_show and self.ai_cues and pos is not None:
+            pos -= self.cfg.data["sub_delay"]
             i = bisect.bisect_right(self.ai_starts, pos) - 1
             if i >= 0 and pos <= self.ai_cues[i][1]:
                 text = self.ai_cues[i][2]
@@ -1365,16 +1508,13 @@ class Window(Adw.ApplicationWindow):
         self.ai_sub.set_visible(bool(text))
         if text:
             height = self.stage.get_height()
-            px = int(min(44, max(15, height * 0.045)))
+            px = int(min(120, max(12, height * 0.045 * self.cfg.data["sub_scale"])))
             if px != self._sub_px:
                 self._sub_px = px
-                attrs = Pango.AttrList()
-                attrs.insert(Pango.attr_size_new_absolute(px * Pango.SCALE))
-                self.ai_sub.set_attributes(attrs)
+                self.ai_sub.set_attributes(self.sub_attrs(px))
+            margin = max(8, int(height * self.cfg.data["sub_position"]))
             if self.view.get_reveal_bottom_bars():
-                margin = self.view.get_bottom_bar_height() + 6
-            else:
-                margin = max(16, int(height * 0.05))
+                margin = max(margin, self.view.get_bottom_bar_height() + 6)
             if self.ai_sub.get_margin_bottom() != margin:
                 self.ai_sub.set_margin_bottom(margin)
         return GLib.SOURCE_CONTINUE
@@ -1437,7 +1577,8 @@ class App(Adw.Application):
 
     def do_startup(self):
         Adw.Application.do_startup(self)
-        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        prefs.apply_theme(self.cfg.data["theme"])
+        prefs.set_hardware_decoding(self.cfg.data["hw_decode"])
         css = Gtk.CssProvider()
         css.load_from_data(CSS, -1)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
@@ -1449,6 +1590,7 @@ class App(Adw.Application):
         self.set_accels_for_action("win.open", ["<Ctrl>o"])
         self.set_accels_for_action("win.open-url", ["<Ctrl>l"])
         self.set_accels_for_action("win.shortcuts", ["<Ctrl>question"])
+        self.set_accels_for_action("win.preferences", ["<Ctrl>comma"])
 
     def _window(self):
         if self.window is None:
